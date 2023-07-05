@@ -130,6 +130,43 @@ case $CLUSTER_TYPE in
   MACHINE_SET=$(yq-v4 ".spec.template.spec.providerSpec.value.vmSize = \"${ADDITIONAL_WORKER_VM_TYPE}\"
        | .spec.template.spec.providerSpec.value.image.resourceID = \"${resource_id}\"" <<< "$MACHINE_SET")
 ;;
+*gcp*)
+  echo "Configuring gcloud..."
+  if ! gcloud --version; then
+    GCLOUD_TAR="google-cloud-sdk-256.0.0-linux-x86_64.tar.gz"
+    GCLOUD_URL="https://dl.google.com/dl/cloudsdk/channels/rapid/downloads/$GCLOUD_TAR"
+    echo "gcloud not installed: installing from $GCLOUD_URL"
+    pushd /tmp
+    curl -O "$GCLOUD_URL"
+    tar -xzf "$GCLOUD_TAR"
+    export PATH=/tmp/google-cloud-sdk/bin:${PATH}
+    popd
+  fi
+  if [[ -s "${SHARED_DIR}/xpn.json" ]] && [[ -f "${CLUSTER_PROFILE_DIR}/xpn_creds.json" ]]; then
+    echo "Activating XPN service-account..."
+    GOOGLE_CLOUD_XPN_KEYFILE_JSON="${CLUSTER_PROFILE_DIR}/xpn_creds.json"
+    gcloud auth activate-service-account --key-file="${GOOGLE_CLOUD_XPN_KEYFILE_JSON}"
+    GOOGLE_CLOUD_XPN_SA=$(jq -r .client_email "${GOOGLE_CLOUD_XPN_KEYFILE_JSON}")
+  fi
+  export GOOGLE_CLOUD_KEYFILE_JSON="${CLUSTER_PROFILE_DIR}/gce.json"
+  gcloud auth activate-service-account --key-file="${GOOGLE_CLOUD_KEYFILE_JSON}"
+  gcloud config set project "$(jq -r .gcp.projectID "${SHARED_DIR}/metadata.json")"
+  echo "Creating the cluster image..."
+  infra_id=$(yq-v4 '.infraID' < "${SHARED_DIR}"/metadata.json)
+  imagename="${infra_id}-rhcos-image-${ADDITIONAL_WORKER_ARCHITECTURE}"
+  oc -n openshift-machine-config-operator get configmap/coreos-bootimages -oyaml | \
+    yq-v4 ".data.stream \
+         | eval(.).architectures.${ADDITIONAL_WORKER_ARCHITECTURE}.images.gcp" > gcp.json
+  source_image="$(jq -r .name < gcp.json)"
+  source_project="$(jq -r .project < gcp.json)"
+  rm -f gcp.json
+  echo "Creating image from ${source_image} in ${source_project}"
+  gcloud compute images create "${imagename}" --source-image="${source_image}" --source-image-project="${source_project}"
+  cluster_image="$(gcloud compute images describe "${imagename}" --format json | jq -r .selfLink)"
+  echo "Using CLUSTER_IMAGE=${cluster_image}"
+  MACHINE_SET=$(yq-v4 ".spec.template.spec.providerSpec.value.machineType = \"${ADDITIONAL_WORKER_VM_TYPE}\"
+       | .spec.template.spec.providerSpec.value.disks[0].image = \"${cluster_image}\"" <<< "$MACHINE_SET")
+;;
 *)
   echo "Adding workers with a different ISA for jobs using the cluster type ${CLUSTER_TYPE} is not implemented yet..."
   exit 4
